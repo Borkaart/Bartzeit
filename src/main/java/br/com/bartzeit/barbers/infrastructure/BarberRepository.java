@@ -8,7 +8,7 @@ import java.util.UUID;
 
 public interface BarberRepository {
     Barber save(Barber barber);
-    Optional<Barber> findById(UUID id);
     Optional<Barber> findByIdAndBarbershopId(UUID id, UUID barbershopId);
+    Optional<Barber> lockByIdAndBarbershopId(UUID id, UUID barbershopId);
     List<Barber> findAllByBarbershopId(UUID barbershopId);
 }

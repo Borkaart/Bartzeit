@@ -8,7 +8,6 @@ import java.util.UUID;
 
 public interface ServiceRepository {
     ServiceOffering save(ServiceOffering offering);
-    Optional<ServiceOffering> findById(UUID id);
     Optional<ServiceOffering> findByIdAndBarbershopId(UUID id, UUID barbershopId);
     List<ServiceOffering> findAllByBarbershopId(UUID barbershopId);
 }

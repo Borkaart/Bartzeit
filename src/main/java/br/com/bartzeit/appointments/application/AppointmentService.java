@@ -12,10 +12,9 @@ import br.com.bartzeit.services.application.ServiceCatalogService;
 import br.com.bartzeit.services.domain.ServiceOffering;
 import br.com.bartzeit.shared.error.ConflictException;
 import br.com.bartzeit.shared.error.ResourceNotFoundException;
-import br.com.bartzeit.shared.tenant.TenantResolver;
-import br.com.bartzeit.tenants.domain.Barbershop;
-import br.com.bartzeit.tenants.infrastructure.BarbershopRepository;
+import br.com.bartzeit.shared.tenant.TenantContext;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -27,47 +26,47 @@ import java.util.UUID;
 @Service
 public class AppointmentService {
     private final AppointmentRepository appointmentRepository;
-    private final BarbershopRepository barbershopRepository;
     private final BarberRepository barberRepository;
     private final CustomerRepository customerRepository;
     private final ServiceCatalogService serviceCatalogService;
     private final BarberService barberService;
-    private final TenantResolver tenantResolver;
 
     public AppointmentService(AppointmentRepository appointmentRepository,
-                              BarbershopRepository barbershopRepository,
                               BarberRepository barberRepository,
                               CustomerRepository customerRepository,
                               ServiceCatalogService serviceCatalogService,
-                              BarberService barberService,
-                              TenantResolver tenantResolver) {
+                              BarberService barberService) {
         this.appointmentRepository = appointmentRepository;
-        this.barbershopRepository = barbershopRepository;
         this.barberRepository = barberRepository;
         this.customerRepository = customerRepository;
         this.serviceCatalogService = serviceCatalogService;
         this.barberService = barberService;
-        this.tenantResolver = tenantResolver;
     }
 
-    public AppointmentResponse createAppointment(String tenantSlug, CreateAppointmentRequest request) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
+    @Transactional
+    public AppointmentResponse createAppointment(TenantContext tenant, CreateAppointmentRequest request) {
+        if (request.serviceId() == null || request.startsAt() == null) {
+            throw new IllegalArgumentException("Service and start time are required.");
+        }
+        if (request.customerId() == null && (request.customerName() == null || request.customerName().isBlank())) {
+            throw new IllegalArgumentException("A customer ID or customer name is required.");
+        }
 
-        ServiceOffering service = serviceCatalogService.requireServiceInTenant(normalized, request.serviceId());
-        Customer customer = resolveCustomer(normalized, request.customerId(), request.customerName());
+        ServiceOffering service = serviceCatalogService.requireServiceInTenant(tenant, request.serviceId());
+        if (!service.isActive()) {
+            throw new ConflictException("The selected service is inactive.");
+        }
+        Customer customer = resolveCustomer(tenant, request.customerId(), request.customerName(), null);
 
         LocalDateTime startsAt = request.startsAt();
         if (startsAt.isBefore(LocalDateTime.now())) {
             throw new IllegalArgumentException("Appointments cannot be scheduled in the past.");
         }
-
-        Barber barber = resolveAvailableBarber(barbershop, request.barberId(), startsAt, service.getDurationMinutes());
+        Barber barber = lockAvailableBarber(tenant, request.barberId(), startsAt, service.getDurationMinutes(), null);
 
         Appointment appointment = new Appointment(
                 UUID.randomUUID(),
-                barbershop.getId(),
+                tenant.barbershopId(),
                 service.getId(),
                 barber.getId(),
                 customer.getId(),
@@ -77,137 +76,158 @@ public class AppointmentService {
                 AppointmentStatus.CONFIRMED,
                 request.notes()
         );
-
-        Appointment saved = appointmentRepository.save(appointment);
-        return toResponse(saved);
+        return toResponse(appointmentRepository.save(appointment));
     }
 
-    public List<AppointmentResponse> listAppointments(String tenantSlug, LocalDateTime from, LocalDateTime to) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
+    public List<AppointmentResponse> listAppointments(
+            TenantContext tenant, LocalDateTime from, LocalDateTime to) {
         LocalDateTime start = from == null ? LocalDateTime.now().minusDays(7) : from;
         LocalDateTime end = to == null ? LocalDateTime.now().plusDays(30) : to;
-        return appointmentRepository.findBetween(barbershop.getId(), start, end).stream()
+        validateRange(start, end);
+        return appointmentRepository.findBetween(tenant.barbershopId(), start, end).stream()
                 .map(this::toResponse)
                 .toList();
     }
 
-    public AppointmentResponse getAppointment(String tenantSlug, UUID appointmentId) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("Appointment '%s' was not found.".formatted(appointmentId)));
-        if (!appointment.getBarbershopId().equals(barbershop.getId())) {
-            throw new ResourceNotFoundException("Appointment '%s' was not found in tenant '%s'.".formatted(appointmentId, normalized));
-        }
-        return toResponse(appointment);
+    public AppointmentResponse getAppointment(TenantContext tenant, UUID appointmentId) {
+        return appointmentRepository.findByIdAndBarbershopId(appointmentId, tenant.barbershopId())
+                .map(this::toResponse)
+                .orElseThrow(() -> new ResourceNotFoundException("Appointment was not found in this tenant."));
     }
 
-    public List<AppointmentResponse> listAppointmentsForBarber(String tenantSlug, UUID barberId, LocalDateTime from, LocalDateTime to) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-        Barber barber = barberService.requireBarberInTenant(normalized, barberId);
-        if (!barber.getBarbershopId().equals(barbershop.getId())) {
-            throw new ResourceNotFoundException("Barber '%s' was not found in tenant '%s'.".formatted(barberId, normalized));
+    @Transactional
+    public AppointmentResponse updateAppointment(
+            TenantContext tenant, UUID appointmentId, CreateAppointmentRequest request) {
+        Appointment appointment = appointmentRepository.findByIdAndBarbershopId(appointmentId, tenant.barbershopId())
+                .orElseThrow(() -> new ResourceNotFoundException("Appointment was not found in this tenant."));
+        if (appointment.getStatus() == AppointmentStatus.COMPLETED
+                || appointment.getStatus() == AppointmentStatus.CANCELLED) {
+            throw new ConflictException("Completed or cancelled appointments cannot be changed.");
         }
+        if (request.serviceId() == null || request.startsAt() == null) {
+            throw new IllegalArgumentException("Service and start time are required.");
+        }
+        ServiceOffering service = serviceCatalogService.requireServiceInTenant(tenant, request.serviceId());
+        if (!service.isActive()) {
+            throw new ConflictException("The selected service is inactive.");
+        }
+        Customer customer = resolveCustomer(tenant, request.customerId(), request.customerName(), appointment);
+        if (request.startsAt().isBefore(LocalDateTime.now())) {
+            throw new IllegalArgumentException("Appointments cannot be scheduled in the past.");
+        }
+        Barber barber = lockAvailableBarber(
+                tenant, request.barberId(), request.startsAt(), service.getDurationMinutes(), appointmentId);
+
+        appointment.setServiceId(service.getId());
+        appointment.setBarberId(barber.getId());
+        appointment.setCustomerId(customer.getId());
+        appointment.setCustomerName(customer.getName());
+        appointment.setStartsAt(request.startsAt());
+        appointment.setDurationMinutes(service.getDurationMinutes());
+        appointment.setNotes(request.notes());
+        return toResponse(appointmentRepository.save(appointment));
+    }
+
+    public List<AppointmentResponse> listAppointmentsForBarber(
+            TenantContext tenant, UUID barberId, LocalDateTime from, LocalDateTime to) {
+        barberService.requireBarberInTenant(tenant, barberId);
         LocalDateTime start = from == null ? LocalDateTime.now().minusDays(7) : from;
         LocalDateTime end = to == null ? LocalDateTime.now().plusDays(30) : to;
-        return appointmentRepository.findByBarberBetween(barber.getId(), start, end).stream()
+        validateRange(start, end);
+        return appointmentRepository.findByBarberBetween(tenant.barbershopId(), barberId, start, end).stream()
                 .map(this::toResponse)
                 .toList();
     }
 
-    public List<BarberAvailabilityResponse> getAvailability(String tenantSlug, LocalDate date, UUID serviceId) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
-        ServiceOffering service = serviceCatalogService.requireServiceInTenant(normalized, serviceId);
-        List<Barber> barbers = barberRepository.findAllByBarbershopId(barbershop.getId()).stream()
+    public List<BarberAvailabilityResponse> getAvailability(TenantContext tenant, LocalDate date, UUID serviceId) {
+        ServiceOffering service = serviceCatalogService.requireServiceInTenant(tenant, serviceId);
+        List<Barber> barbers = barberRepository.findAllByBarbershopId(tenant.barbershopId()).stream()
                 .filter(Barber::isActive)
                 .toList();
 
         List<BarberAvailabilityResponse> responses = new ArrayList<>();
         for (Barber barber : barbers) {
             List<LocalDateTime> availableSlots = new ArrayList<>();
-            LocalDateTime startOfDay = date.atTime(LocalTime.of(9, 0));
-            LocalDateTime endOfDay = date.atTime(LocalTime.of(20, 0));
-            LocalDateTime current = startOfDay;
+            LocalDateTime endOfDay = date.atTime(20, 0);
+            LocalDateTime current = date.atTime(LocalTime.of(9, 0));
             while (!current.plusMinutes(service.getDurationMinutes()).isAfter(endOfDay)) {
                 LocalDateTime slotEnd = current.plusMinutes(service.getDurationMinutes());
-                boolean overlap = appointmentRepository.hasOverlap(barber.getId(), current, slotEnd);
+                boolean overlap = appointmentRepository.hasOverlap(
+                        tenant.barbershopId(), barber.getId(), current, slotEnd, null);
                 if (!overlap && current.isAfter(LocalDateTime.now())) {
                     availableSlots.add(current);
                 }
                 current = current.plusMinutes(30);
             }
-            responses.add(new BarberAvailabilityResponse(barber.getId(), barber.getName(), !availableSlots.isEmpty(), availableSlots));
+            responses.add(new BarberAvailabilityResponse(barber.getId(), barber.getName(),
+                    !availableSlots.isEmpty(), availableSlots));
         }
         return responses;
     }
 
-    public AppointmentResponse updateStatus(String tenantSlug, UUID appointmentId, AppointmentStatus status) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
-        Appointment appointment = appointmentRepository.findById(appointmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("Appointment '%s' was not found.".formatted(appointmentId)));
-        if (!appointment.getBarbershopId().equals(barbershop.getId())) {
-            throw new ResourceNotFoundException("Appointment '%s' was not found in tenant '%s'.".formatted(appointmentId, normalized));
-        }
+    @Transactional
+    public AppointmentResponse updateStatus(TenantContext tenant, UUID appointmentId, AppointmentStatus status) {
+        Appointment appointment = appointmentRepository.findByIdAndBarbershopId(appointmentId, tenant.barbershopId())
+                .orElseThrow(() -> new ResourceNotFoundException("Appointment was not found in this tenant."));
         if (!appointment.canTransitionTo(status)) {
-            throw new ConflictException("The status transition from '%s' to '%s' is not allowed.".formatted(appointment.getStatus(), status));
+            throw new ConflictException("The requested appointment status transition is not allowed.");
         }
         appointment.setStatus(status);
         return toResponse(appointmentRepository.save(appointment));
     }
 
-    private Customer resolveCustomer(String tenantSlug, UUID customerId, String customerName) {
+    private Customer resolveCustomer(
+            TenantContext tenant, UUID customerId, String customerName, Appointment existingAppointment) {
         if (customerId != null) {
-            String normalized = tenantResolver.resolve(tenantSlug);
-            Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                    .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-            return customerRepository.findByIdAndBarbershopId(customerId, barbershop.getId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Customer '%s' was not found in tenant '%s'.".formatted(customerId, normalized)));
+            return customerRepository.findByIdAndBarbershopId(customerId, tenant.barbershopId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Customer was not found in this tenant."));
+        }
+        if ((customerName == null || customerName.isBlank()) && existingAppointment != null) {
+            return customerRepository.findByIdAndBarbershopId(existingAppointment.getCustomerId(), tenant.barbershopId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Customer was not found in this tenant."));
         }
         if (customerName == null || customerName.isBlank()) {
-            throw new IllegalArgumentException("Customer name is required.");
+            throw new IllegalArgumentException("A customer ID or customer name is required.");
         }
-        return new Customer(UUID.randomUUID(), null, customerName, null, null);
+        Customer customer = new Customer(UUID.randomUUID(), tenant.barbershopId(), customerName.trim(), null, null);
+        return customerRepository.save(customer);
     }
 
-    private Barber resolveAvailableBarber(Barbershop barbershop, UUID barberId, LocalDateTime startsAt, int durationMinutes) {
+    private Barber lockAvailableBarber(TenantContext tenant, UUID barberId, LocalDateTime startsAt, int durationMinutes,
+                                       UUID excludedAppointmentId) {
+        LocalDateTime endsAt = startsAt.plusMinutes(durationMinutes);
         if (barberId != null) {
-            Barber barber = barberRepository.findByIdAndBarbershopId(barberId, barbershop.getId())
-                    .orElseThrow(() -> new ResourceNotFoundException("Barber '%s' was not found in tenant '%s'.".formatted(barberId, barbershop.getSlug())));
+            Barber barber = barberRepository.lockByIdAndBarbershopId(barberId, tenant.barbershopId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Barber was not found in this tenant."));
             if (!barber.isActive()) {
-                throw new ConflictException("Barber '%s' is inactive.".formatted(barberId));
+                throw new ConflictException("The selected barber is inactive.");
             }
-            if (appointmentRepository.hasOverlap(barber.getId(), startsAt, startsAt.plusMinutes(durationMinutes))) {
+            if (appointmentRepository.hasOverlap(
+                    tenant.barbershopId(), barber.getId(), startsAt, endsAt, excludedAppointmentId)) {
                 throw new ConflictException("The selected barber has a conflicting appointment at the requested time.");
             }
             return barber;
         }
 
-        List<Barber> activeBarbers = barberRepository.findAllByBarbershopId(barbershop.getId()).stream()
-                .filter(Barber::isActive)
-                .toList();
-        if (activeBarbers.isEmpty()) {
-            throw new ConflictException("There are no active barbers available in this barbershop.");
-        }
-
-        for (Barber barber : activeBarbers) {
-            if (!appointmentRepository.hasOverlap(barber.getId(), startsAt, startsAt.plusMinutes(durationMinutes))) {
+        for (Barber candidate : barberRepository.findAllByBarbershopId(tenant.barbershopId())) {
+            if (!candidate.isActive()) {
+                continue;
+            }
+            Barber barber = barberRepository.lockByIdAndBarbershopId(candidate.getId(), tenant.barbershopId())
+                    .orElseThrow(() -> new ResourceNotFoundException("Barber was not found in this tenant."));
+            if (barber.isActive()
+                    && !appointmentRepository.hasOverlap(
+                            tenant.barbershopId(), barber.getId(), startsAt, endsAt, excludedAppointmentId)) {
                 return barber;
             }
         }
         throw new ConflictException("No barber is available at the requested time.");
+    }
+
+    private void validateRange(LocalDateTime from, LocalDateTime to) {
+        if (!from.isBefore(to)) {
+            throw new IllegalArgumentException("The start of the requested range must be before its end.");
+        }
     }
 
     public AppointmentResponse toResponse(Appointment appointment) {

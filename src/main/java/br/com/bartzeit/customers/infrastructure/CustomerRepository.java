@@ -8,7 +8,6 @@ import java.util.UUID;
 
 public interface CustomerRepository {
     Customer save(Customer customer);
-    Optional<Customer> findById(UUID id);
     Optional<Customer> findByIdAndBarbershopId(UUID id, UUID barbershopId);
     List<Customer> findAllByBarbershopId(UUID barbershopId);
 }

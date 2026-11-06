@@ -46,7 +46,7 @@ public class ApiExceptionHandler {
 
     @ExceptionHandler({ConstraintViolationException.class, HttpMessageNotReadableException.class, IllegalArgumentException.class})
     public ResponseEntity<ApiError> handleBadRequest(Exception ex, HttpServletRequest request) {
-        return build(HttpStatus.BAD_REQUEST, "INVALID_INPUT", ex.getMessage(), request.getRequestURI());
+        return build(HttpStatus.BAD_REQUEST, "INVALID_INPUT", "Request contains invalid values.", request.getRequestURI());
     }
 
     @ExceptionHandler(AuthenticationException.class)

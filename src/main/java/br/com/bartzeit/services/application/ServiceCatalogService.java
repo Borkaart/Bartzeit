@@ -2,11 +2,8 @@ package br.com.bartzeit.services.application;
 
 import br.com.bartzeit.services.domain.ServiceOffering;
 import br.com.bartzeit.services.infrastructure.ServiceRepository;
-import br.com.bartzeit.shared.error.ConflictException;
 import br.com.bartzeit.shared.error.ResourceNotFoundException;
-import br.com.bartzeit.shared.tenant.TenantResolver;
-import br.com.bartzeit.tenants.domain.Barbershop;
-import br.com.bartzeit.tenants.infrastructure.BarbershopRepository;
+import br.com.bartzeit.shared.tenant.TenantContext;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -16,24 +13,16 @@ import java.util.UUID;
 @Service
 public class ServiceCatalogService {
     private final ServiceRepository serviceRepository;
-    private final BarbershopRepository barbershopRepository;
-    private final TenantResolver tenantResolver;
 
-    public ServiceCatalogService(ServiceRepository serviceRepository, BarbershopRepository barbershopRepository, TenantResolver tenantResolver) {
+    public ServiceCatalogService(ServiceRepository serviceRepository) {
         this.serviceRepository = serviceRepository;
-        this.barbershopRepository = barbershopRepository;
-        this.tenantResolver = tenantResolver;
     }
 
-    public ServiceResponse createService(String tenantSlug, CreateServiceRequest request) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
+    public ServiceResponse createService(TenantContext tenant, CreateServiceRequest request) {
         validate(request);
         ServiceOffering service = new ServiceOffering(
                 UUID.randomUUID(),
-                barbershop.getId(),
+                tenant.barbershopId(),
                 request.name(),
                 request.description(),
                 request.durationMinutes(),
@@ -44,33 +33,22 @@ public class ServiceCatalogService {
         return toResponse(saved);
     }
 
-    public List<ServiceResponse> listServices(String tenantSlug) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
-        return serviceRepository.findAllByBarbershopId(barbershop.getId()).stream()
+    public List<ServiceResponse> listServices(TenantContext tenant) {
+        return serviceRepository.findAllByBarbershopId(tenant.barbershopId()).stream()
                 .filter(ServiceOffering::isActive)
                 .map(this::toResponse)
                 .toList();
     }
 
-    public ServiceResponse getService(String tenantSlug, UUID serviceId) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-
-        ServiceOffering service = serviceRepository.findByIdAndBarbershopId(serviceId, barbershop.getId())
-                .orElseThrow(() -> new ResourceNotFoundException("Service '%s' was not found in tenant '%s'.".formatted(serviceId, normalized)));
+    public ServiceResponse getService(TenantContext tenant, UUID serviceId) {
+        ServiceOffering service = serviceRepository.findByIdAndBarbershopId(serviceId, tenant.barbershopId())
+                .orElseThrow(() -> new ResourceNotFoundException("Service was not found in this tenant."));
         return toResponse(service);
     }
 
-    public ServiceOffering requireServiceInTenant(String tenantSlug, UUID serviceId) {
-        String normalized = tenantResolver.resolve(tenantSlug);
-        Barbershop barbershop = barbershopRepository.findBySlug(normalized)
-                .orElseThrow(() -> new ResourceNotFoundException("Barbershop '%s' was not found.".formatted(normalized)));
-        return serviceRepository.findByIdAndBarbershopId(serviceId, barbershop.getId())
-                .orElseThrow(() -> new ResourceNotFoundException("Service '%s' was not found in tenant '%s'.".formatted(serviceId, normalized)));
+    public ServiceOffering requireServiceInTenant(TenantContext tenant, UUID serviceId) {
+        return serviceRepository.findByIdAndBarbershopId(serviceId, tenant.barbershopId())
+                .orElseThrow(() -> new ResourceNotFoundException("Service was not found in this tenant."));
     }
 
     private void validate(CreateServiceRequest request) {
